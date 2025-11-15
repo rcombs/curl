@@ -675,6 +675,7 @@ endif()
 
 if(APPLE)
   cmake_dependent_option(CURL_USE_SECTRANSP "Enable Apple OS native SSL/TLS (Secure Transport)" OFF CURL_ENABLE_SSL OFF)
+  cmake_dependent_option(CURL_USE_NWF "Enable Apple Network.framework for SSL/TLS" OFF CURL_ENABLE_SSL OFF)
 endif()
 if(WIN32)
   cmake_dependent_option(CURL_USE_SCHANNEL "Enable Windows native SSL/TLS (Schannel)" OFF CURL_ENABLE_SSL OFF)
@@ -688,6 +689,7 @@ cmake_dependent_option(CURL_USE_RUSTLS "Enable Rustls for SSL/TLS" OFF CURL_ENAB
 
 if(WIN32 OR
    CURL_USE_SECTRANSP OR
+   CURL_USE_NWF OR
    CURL_USE_SCHANNEL OR
    CURL_USE_MBEDTLS OR
    CURL_USE_BEARSSL OR
@@ -709,6 +711,7 @@ option(CURL_DISABLE_OPENSSL_AUTO_LOAD_CONFIG "Disable automatic loading of OpenS
 curl_count_true(_enabled_ssl_options_count
   CURL_USE_SCHANNEL
   CURL_USE_SECTRANSP
+  CURL_USE_NWF
   CURL_USE_OPENSSL
   CURL_USE_MBEDTLS
   CURL_USE_BEARSSL
@@ -764,6 +767,7 @@ if(CURL_USE_NWF)
     message(FATAL_ERROR "Network framework not found")
   endif()
   list(APPEND CURL_LIBS "-framework Network")
+  list(APPEND CURL_LIBS "-framework Security")
 
   set(_ssl_enabled ON)
   set(USE_NWF ON)
@@ -2117,6 +2121,7 @@ if(NOT CURL_DISABLE_NTLM AND
     USE_MBEDTLS OR
     USE_GNUTLS OR
     USE_SECTRANSP OR
+    USE_NWF OR
     USE_WIN32_CRYPTO OR
     (USE_WOLFSSL AND HAVE_WOLFSSL_DES_ECB_ENCRYPT)))
   set(_use_curl_ntlm_core ON)
@@ -2198,7 +2203,7 @@ curl_add_if("HTTP3"         USE_NGTCP2 OR USE_QUICHE OR USE_MSH3 OR USE_OPENSSL_
 curl_add_if("MultiSSL"      CURL_WITH_MULTI_SSL)
 curl_add_if("HTTPS-proxy"   NOT CURL_DISABLE_PROXY AND _ssl_enabled AND (USE_OPENSSL OR USE_GNUTLS
                             OR USE_SCHANNEL OR USE_RUSTLS OR USE_BEARSSL OR
-                            USE_MBEDTLS OR USE_SECTRANSP OR
+                            USE_MBEDTLS OR USE_SECTRANSP OR USE_NWF OR
                             (USE_WOLFSSL AND HAVE_WOLFSSL_BIO_NEW)))
 curl_add_if("Unicode"       ENABLE_UNICODE)
 curl_add_if("threadsafe"    HAVE_ATOMIC OR
@@ -2224,15 +2229,16 @@ message(STATUS "Features: ${SUPPORT_FEATURES}")
 
 # Clear list and collect SSL backends
 set(_items "")
-curl_add_if("Schannel"         _ssl_enabled AND USE_SCHANNEL)
-curl_add_if("${_openssl}"      _ssl_enabled AND USE_OPENSSL AND OPENSSL_VERSION VERSION_LESS 3.0.0)
-curl_add_if("${_openssl} v3+"  _ssl_enabled AND USE_OPENSSL AND OPENSSL_VERSION VERSION_GREATER_EQUAL 3.0.0)
-curl_add_if("Secure Transport" _ssl_enabled AND USE_SECTRANSP)
-curl_add_if("mbedTLS"          _ssl_enabled AND USE_MBEDTLS)
-curl_add_if("BearSSL"          _ssl_enabled AND USE_BEARSSL)
-curl_add_if("wolfSSL"          _ssl_enabled AND USE_WOLFSSL)
-curl_add_if("GnuTLS"           _ssl_enabled AND USE_GNUTLS)
-curl_add_if("rustls"           _ssl_enabled AND USE_RUSTLS)
+curl_add_if("Schannel"          _ssl_enabled AND USE_SCHANNEL)
+curl_add_if("${_openssl}"       _ssl_enabled AND USE_OPENSSL AND OPENSSL_VERSION VERSION_LESS 3.0.0)
+curl_add_if("${_openssl} v3+"   _ssl_enabled AND USE_OPENSSL AND OPENSSL_VERSION VERSION_GREATER_EQUAL 3.0.0)
+curl_add_if("Secure Transport"  _ssl_enabled AND USE_SECTRANSP)
+curl_add_if("mbedTLS"           _ssl_enabled AND USE_MBEDTLS)
+curl_add_if("BearSSL"           _ssl_enabled AND USE_BEARSSL)
+curl_add_if("wolfSSL"           _ssl_enabled AND USE_WOLFSSL)
+curl_add_if("GnuTLS"            _ssl_enabled AND USE_GNUTLS)
+curl_add_if("rustls"            _ssl_enabled AND USE_RUSTLS)
+curl_add_if("Network.framework" _ssl_enabled AND USE_NWF)
 
 if(_items)
   if(CMAKE_VERSION VERSION_GREATER_EQUAL 3.13)

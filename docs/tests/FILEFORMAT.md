@@ -481,6 +481,7 @@ Features testable here are:
 - `nghttpx-h3`
 - `NTLM`
 - `NTLM_WB`
+- `nwf`
 - `OpenSSL`
 - `override-dns` - this build can use a "fake" DNS server
 - `parsedate`

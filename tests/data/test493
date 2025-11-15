@@ -31,7 +31,6 @@ http
 HSTS
 proxy
 https
-!nwf
 </features>
 
 <file name="%LOGDIR/input%TESTNUMBER">

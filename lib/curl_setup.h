@@ -775,7 +775,7 @@
 /* Single point where USE_NTLM definition might be defined */
 #ifndef CURL_DISABLE_NTLM
 #  if defined(USE_OPENSSL) || defined(USE_MBEDTLS) ||                   \
-  defined(USE_GNUTLS) || defined(USE_SECTRANSP) ||                      \
+  defined(USE_GNUTLS) || defined(USE_SECTRANSP) || defined(USE_NWF) ||  \
   defined(USE_OS400CRYPTO) || defined(USE_WIN32_CRYPTO) ||              \
   (defined(USE_WOLFSSL) && defined(HAVE_WOLFSSL_DES_ECB_ENCRYPT))
 #    define USE_CURL_NTLM_CORE

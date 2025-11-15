@@ -28,18 +28,18 @@
 #ifdef USE_NWF
 
 #include "apple.h"
-#include "urldata.h"
-#include "cfilters.h"
+#include "../urldata.h"
+#include "../cfilters.h"
 #include "vtls.h"
 #include "vtls_int.h"
-#include "sendf.h"
-#include "connect.h"
-#include "strerror.h"
-#include "select.h"
+#include "../sendf.h"
+#include "../connect.h"
+#include "../strerror.h"
+#include "../select.h"
 #include "../socketpair.h"
 #include "../http_proxy.h"
-#include "multiif.h"
-#include "curl_printf.h"
+#include "../multiif.h"
+#include "../curl_printf.h"
 #include <Network/Network.h>
 #include <CoreFoundation/CoreFoundation.h>
 #include <CommonCrypto/CommonDigest.h>
@@ -80,7 +80,6 @@ struct nwf_ssl_backend_data {
   int signal_pipe[2];
   bool write_outstanding;
   bool read_outstanding;
-  nw_endpoint_t remote_endpoint, local_endpoint;
   struct Curl_sockaddr_ex remote_addr;
   unsigned char alpn;
 };
@@ -270,21 +269,81 @@ static void nwf_signal(struct nwf_ssl_backend_data *backend)
     wakeup_write(backend->signal_pipe[1], buf, sizeof(buf));
 }
 
-static nw_endpoint_t nwf_make_host_endpoint(const char *host, int port)
-{
-  char portstr[20];
-  char hoststr[256];
-  size_t len = strlen(host);
+static nw_protocol_options_t nwf_curl_create_options(struct Curl_cfilter *cf,
+                                                     struct Curl_easy *data) {
+  nw_framer_start_handler_t start_handler;
+  nw_framer_input_handler_t input_handler;
+  nw_framer_output_handler_t output_handler;
+  nw_framer_wakeup_handler_t wakeup_handler;
+  nw_framer_parse_completion_t parse;
 
-  /* NWF doesn't like trailing dots in hostnames */
-  if(len > 0 && host[len - 1] == '.') {
-    len--;
-  }
+  nw_protocol_definition_t curl_def;
+  nw_protocol_options_t curl_opts;
 
-  msnprintf(portstr, sizeof(portstr), "%i", port);
-  msnprintf(hoststr, sizeof(hoststr), "%.*s", (int)len, host);
+  input_handler = ^size_t(nw_framer_t framer UNUSED_PARAM) {
+    return 0;
+  };
 
-  return nw_endpoint_create_host(hoststr, portstr);
+  parse = ^size_t(uint8_t *buf, size_t buffer_length, bool is_complete) {
+    ssize_t nwritten;
+    CURLcode result;
+
+    DEBUGASSERT(data);
+    nwritten = Curl_conn_cf_send(cf->next, data, buf, buffer_length,
+                                 is_complete, &result);
+    return nwritten;
+  };
+
+  output_handler =
+      ^(nw_framer_t framer, nw_framer_message_t message UNUSED_PARAM,
+        size_t message_length, bool is_complete UNUSED_PARAM) {
+        uint8_t *temp_buffer = malloc(message_length * sizeof(uint8_t));
+        nw_framer_parse_output(framer, message_length, message_length,
+                               temp_buffer, parse);
+      };
+
+  wakeup_handler = ^(nw_framer_t framer) {
+    ssize_t nread;
+    CURLcode result;
+    nw_framer_message_t msg;
+    static char buf[BUFSIZ];
+
+    DEBUGASSERT(data);
+    nread = Curl_conn_cf_recv(cf->next, data, buf, BUFSIZ, &result);
+
+    if(result == CURLE_OK) {
+      if(nread > 0) {
+        msg = nw_framer_message_create(framer);
+        nw_framer_deliver_input(framer, (uint8_t *)buf, nread, msg, FALSE);
+        nw_release(msg);
+      }
+      nw_framer_schedule_wakeup(framer, 0);
+    }
+    else if(result == CURLE_AGAIN) {
+      nw_framer_schedule_wakeup(framer, 100);
+    }
+    else {
+      nw_framer_mark_failed_with_error(framer, result);
+    }
+  };
+
+  start_handler = ^nw_framer_start_result_t(nw_framer_t framer) {
+    nw_framer_set_input_handler(framer, input_handler);
+    nw_framer_set_output_handler(framer, output_handler);
+    nw_framer_set_wakeup_handler(framer, wakeup_handler);
+    nw_framer_async(framer, ^(void) {
+      nw_framer_schedule_wakeup(framer, 1);
+    });
+    return nw_framer_start_result_ready;
+  };
+
+  curl_def = nw_framer_create_definition("curl",
+                                         NW_FRAMER_CREATE_FLAGS_DEFAULT,
+                                         start_handler);
+  curl_opts = nw_framer_create_options(curl_def);
+
+  nw_release(curl_def);
+  return curl_opts;
 }
 
 static CURLcode nwf_connect_start(struct Curl_cfilter *cf,
@@ -296,15 +355,11 @@ static CURLcode nwf_connect_start(struct Curl_cfilter *cf,
   struct ssl_primary_config *conn_config;
   nw_endpoint_t endpoint;
   nw_parameters_t parameters;
-  nw_parameters_configure_protocol_block_t configure_tls;
-  nw_parameters_configure_protocol_block_t configure_tcp;
+  nw_protocol_options_t tls_opts;
   nw_connection_state_changed_handler_t conn_handler;
 #ifdef USE_ECH
   bool ech_on;
 #endif
-  struct Curl_dns_entry *dns = Curl_dnscache_get(data,
-    connssl->peer.hostname, connssl->peer.port,
-    data->set.ipver);
 
   backend->signal_pipe[0] = backend->signal_pipe[1] = CURL_SOCKET_BAD;
   if(wakeup_create(backend->signal_pipe, true) < 0) {
@@ -315,27 +370,16 @@ static CURLcode nwf_connect_start(struct Curl_cfilter *cf,
   backend->error = CURLE_OK;
   backend->queue = nwf_queue;
 
-  if(dns && dns->timestamp == 0 && dns->addr && dns->addr->ai_addr) {
-    struct sockaddr_storage addr;
-    memcpy(&addr, dns->addr->ai_addr,
-      CURLMIN(sizeof(addr), (size_t)dns->addr->ai_addrlen));
-    addr.ss_len = (uint8_t)dns->addr->ai_addrlen;
-    endpoint = nw_endpoint_create_address((struct sockaddr*)&addr);
-  }
-  else {
-    endpoint = nwf_make_host_endpoint(connssl->peer.hostname,
-      connssl->peer.port);
-  }
-
-  Curl_resolv_unlink(data, &dns);
+  endpoint = nw_endpoint_create_host("0.0.0.0", "0");
 
   conn_config = Curl_ssl_cf_get_primary_config(cf);
-  configure_tls = ^(nw_protocol_options_t tls_opts) {
+  do {
     sec_protocol_options_t opts;
     sec_protocol_verify_t verify_block;
     size_t i;
     bool verify = conn_config->verifypeer;
 
+    tls_opts = nw_tls_create_options();
     opts = nw_tls_copy_sec_protocol_options(tls_opts);
     sec_protocol_options_set_peer_authentication_required(opts, verify);
     nwf_set_ssl_version_min_max(data, opts, conn_config);
@@ -434,7 +478,7 @@ static CURLcode nwf_connect_start(struct Curl_cfilter *cf,
         backend->alpn = CURL_HTTP_VERSION_1_1;
       }
 
-      CFRelease(trust_ref);
+      sec_release(trust_ref);
 
       completion(proceed);
     };
@@ -447,77 +491,29 @@ static CURLcode nwf_connect_start(struct Curl_cfilter *cf,
       );
       Curl_set_in_callback(data, FALSE);
     }
-  };
 
-  configure_tcp = NW_PARAMETERS_DEFAULT_CONFIGURATION;
-  parameters = nw_parameters_create_secure_tcp(configure_tls, configure_tcp);
+    nw_release(opts);
+  } while(0);
 
-  if(data->set.ipver != CURL_IPRESOLVE_WHATEVER) {
+  parameters = nw_parameters_create();
+  do {
     nw_protocol_stack_t protocol_stack =
-      nw_parameters_copy_default_protocol_stack(parameters);
-    nw_protocol_options_t ip_options =
-      nw_protocol_stack_copy_internet_protocol(protocol_stack);
-    if(data->set.ipver == CURL_IPRESOLVE_V4) {
-      nw_ip_options_set_version(ip_options, nw_ip_version_4);
-    }
-    else if(data->set.ipver == CURL_IPRESOLVE_V6) {
-      nw_ip_options_set_version(ip_options, nw_ip_version_6);
-    }
-    nw_release(ip_options);
+        nw_parameters_copy_default_protocol_stack(parameters);
+    nw_protocol_options_t udp_opts = nw_udp_create_options();
+    nw_protocol_options_t curl_opts = nwf_curl_create_options(cf, data);
+    nw_protocol_stack_set_transport_protocol(protocol_stack, udp_opts);
+    nw_protocol_stack_prepend_application_protocol(protocol_stack, curl_opts);
+    nw_protocol_stack_prepend_application_protocol(protocol_stack, tls_opts);
+    nw_release(curl_opts);
     nw_release(protocol_stack);
-  }
-
-  if(__builtin_available(macOS 11, iOS 14, tvOS 14, watchOS 7, *)) {
-    if(cf->conn->bits.socksproxy || cf->conn->bits.httpproxy ||
-       data->set.doh) {
-      nw_privacy_context_t priv = nw_privacy_context_create("curl");
-
-      if(data->set.doh) {
-        nw_endpoint_t ep = nw_endpoint_create_url(data->set.str[STRING_DOH]);
-        nw_resolver_config_t res = nw_resolver_config_create_https(ep);
-        nw_privacy_context_require_encrypted_name_resolution(priv, true, res);
-      }
-
-      if(__builtin_available(macOS 14, iOS 17, tvOS 17, watchOS 10, *)) {
-        if(cf->conn->bits.tunnel_proxy && cf->conn->bits.httpproxy) {
-          nw_protocol_options_t opts = NULL;
-          nw_proxy_config_t proxy;
-
-          nw_endpoint_t ep = nwf_make_host_endpoint(
-            cf->conn->http_proxy.host.name, cf->conn->http_proxy.port);
-
-          if(IS_HTTPS_PROXY(cf->conn->http_proxy.proxytype)) {
-            opts = nw_tls_create_options();
-          }
-
-          proxy = nw_proxy_config_create_http_connect(ep, opts);
-
-          if(cf->conn->bits.proxy_user_passwd) {
-            nw_proxy_config_set_username_and_password(proxy,
-              data->state.aptr.proxyuser,
-              data->state.aptr.proxypasswd);
-          }
-
-          nw_privacy_context_add_proxy(priv, proxy);
-        }
-
-        if(cf->conn->bits.socksproxy) {
-          nw_proxy_config_t proxy;
-
-          nw_endpoint_t ep = nwf_make_host_endpoint(
-            cf->conn->socks_proxy.host.name, cf->conn->socks_proxy.port);
-
-          proxy = nw_proxy_config_create_socksv5(ep);
-          nw_privacy_context_add_proxy(priv, proxy);
-        }
-      }
-
-      nw_parameters_set_privacy_context(parameters, priv);
-    }
-  }
+    nw_release(tls_opts);
+    nw_release(udp_opts);
+  } while(0);
 
   backend->connection = nw_connection_create(endpoint, parameters);
   nw_connection_set_queue(backend->connection, backend->queue);
+  nw_release(endpoint);
+  nw_release(parameters);
 
   conn_handler = ^(nw_connection_state_t state, nw_error_t error) {
     if(error && !backend->error) {
@@ -595,42 +591,6 @@ static CURLcode nwf_connect(struct Curl_cfilter *cf,
   }
 
   if(backend->done_connecting) {
-    nw_path_t path = nw_connection_copy_current_path(backend->connection);
-    dispatch_semaphore_t semaphore = dispatch_semaphore_create(0);
-
-    nw_connection_access_establishment_report(backend->connection,
-      backend->queue, ^(nw_establishment_report_t report) {
-        backend->remote_endpoint =
-          nw_establishment_report_copy_proxy_endpoint(report);
-        dispatch_semaphore_signal(semaphore);
-      });
-
-    dispatch_semaphore_wait(semaphore, DISPATCH_TIME_FOREVER);
-    dispatch_release(semaphore);
-
-    if(path) {
-      backend->local_endpoint = nw_path_copy_effective_local_endpoint(path);
-      if(!backend->remote_endpoint)
-        backend->remote_endpoint =
-          nw_path_copy_effective_remote_endpoint(path);
-
-      if(backend->remote_endpoint) {
-        const struct sockaddr *addr =
-          nw_endpoint_get_address(backend->remote_endpoint);
-        if(addr) {
-          backend->remote_addr.addrlen = addr->sa_len;
-          backend->remote_addr.socktype = SOCK_STREAM;
-          backend->remote_addr.protocol = IPPROTO_TCP;
-          backend->remote_addr.family = addr->sa_family;
-          memcpy(&backend->remote_addr.curl_sa_addr, addr, CURLMIN(
-            sizeof(addr->sa_len),
-            sizeof(struct Curl_sockaddr_storage)));
-        }
-      }
-
-      nw_release(path);
-    }
-
     if(backend->alpn) {
       cf->conn->alpn = backend->alpn;
     }
@@ -835,14 +795,6 @@ static void nwf_close(struct Curl_cfilter *cf,
     dispatch_release(backend->recv_data);
     backend->recv_data = NULL;
   }
-  if(backend->remote_endpoint) {
-    nw_release(backend->remote_endpoint);
-    backend->remote_endpoint = NULL;
-  }
-  if(backend->local_endpoint) {
-    nw_release(backend->local_endpoint);
-    backend->local_endpoint = NULL;
-  }
 
   if(backend->signal_pipe[0] == cf->conn->sock[cf->sockindex])
     cf->conn->sock[cf->sockindex] = CURL_SOCKET_BAD;
@@ -870,71 +822,6 @@ static bool nwf_data_pending(struct Curl_cfilter *cf,
   });
 
   return pending;
-}
-
-static void nwf_update_data(struct Curl_cfilter *cf,
-                            struct Curl_easy *data)
-{
-  struct ssl_connect_data *connssl = cf->ctx;
-  struct nwf_ssl_backend_data *backend =
-    (struct nwf_ssl_backend_data *)connssl->backend;
-
-  /* Update the IP info held in the transfer, if we have that. */
-  if(cf->connected && (cf->sockindex == FIRSTSOCKET) && backend->connection) {
-    if(backend->local_endpoint) {
-      const struct sockaddr *addr =
-        nw_endpoint_get_address(backend->local_endpoint);
-      if(addr) {
-        Curl_addr2string(addr, addr->sa_len, data->info.primary.local_ip,
-          &data->info.primary.local_port);
-      }
-    }
-    if(backend->remote_endpoint) {
-      const struct sockaddr *addr =
-        nw_endpoint_get_address(backend->remote_endpoint);
-      if(addr) {
-      #ifdef USE_IPV6
-        cf->conn->bits.ipv6 = (addr->sa_family == AF_INET6);
-      #endif
-        Curl_addr2string(addr, addr->sa_len, data->info.primary.remote_ip,
-          &data->info.primary.remote_port);
-      }
-    }
-
-    /* not sure if this is redundant... */
-    data->info.conn_remote_port = data->info.primary.remote_port;
-  }
-}
-
-static void nwf_active(struct Curl_cfilter *cf,
-                       struct Curl_easy *data UNUSED_PARAM)
-{
-  struct ssl_connect_data *connssl = cf->ctx;
-  struct nwf_ssl_backend_data *backend =
-    (struct nwf_ssl_backend_data *)connssl->backend;
-
-  /* use this socket from now on */
-  cf->conn->sock[cf->sockindex] = backend->signal_pipe[0];
-  if(backend->remote_endpoint)
-    cf->conn->remote_addr = &backend->remote_addr;
-}
-
-static CURLcode nwf_cntrl(struct Curl_cfilter *cf,
-                          struct Curl_easy *data,
-                          int event, int arg1, void *arg2)
-{
-  (void)arg1;
-  (void)arg2;
-  switch(event) {
-  case CF_CTRL_CONN_INFO_UPDATE:
-    nwf_active(cf, data);
-    nwf_update_data(cf, data);
-    break;
-  case CF_CTRL_DATA_SETUP:
-    nwf_update_data(cf, data);
-    break;
-  }
-  return CURLE_OK;
 }
 
 static bool nwf_is_alive(struct Curl_cfilter *cf,
@@ -970,7 +857,6 @@ const struct Curl_ssl Curl_ssl_nwf = {
 #ifdef USE_ECH
   SSLSUPP_ECH |
 #endif
-  SSLSUPP_NO_UNDERLYING |
   SSLSUPP_CIPHER_LIST,     /* supports */
 
   sizeof(struct nwf_ssl_backend_data),
@@ -995,7 +881,7 @@ const struct Curl_ssl Curl_ssl_nwf = {
   nwf_recv,                /* recv_plain */
   nwf_send,                /* send_plain */
   NULL,                    /* get_channel_binding */
-  nwf_cntrl,               /* cntrl */
+  NULL,                    /* cntrl */
   nwf_is_alive,            /* is_alive */
 };
 

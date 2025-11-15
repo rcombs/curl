@@ -27,7 +27,7 @@
 #include "../curl_setup.h"
 #include <curl/curl.h>
 
-#if (defined(USE_SECTRANSP) || defined(USE_NETWORKFMWK))
+#if (defined(USE_SECTRANSP) || defined(USE_NWF))
 
 #include <Security/Security.h>
 
